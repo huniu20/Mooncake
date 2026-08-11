@@ -4265,13 +4265,43 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
 
-                // Reject if an offload-to-disk task is in progress (same
-                // reason).
-                if (tenant_state.offloading_tasks.count(key) > 0) {
-                    LOG(INFO) << "key=" << key
-                              << ", error=object_has_offloading_task";
-                    return tl::make_unexpected(
-                        ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                // Offload-to-disk conflict: cancel if still QUEUED (mirror
+                // entry present in local_disk_segment.offloading_objects);
+                // otherwise the worker is already draining the source
+                // buffer for SSD, so reject and let the client retry after
+                // NotifyOffloadSuccess clears the marker.
+                {
+                    auto offload_it = tenant_state.offloading_tasks.find(key);
+                    if (offload_it != tenant_state.offloading_tasks.end()) {
+                        const std::string scoped_key =
+                            object_id.tenant_id.MakeScopedKey(key);
+                        bool mirror_present = false;
+                        {
+                            ScopedLocalDiskSegmentAccess ssd_access =
+                                segment_manager_.getLocalDiskSegmentAccess();
+                            for (auto& [_, segment] :
+                                 ssd_access.getClientLocalDiskSegment()) {
+                                MutexLocker locker(&segment->offloading_mutex_);
+                                if (segment->offloading_objects.erase(
+                                        scoped_key) > 0) {
+                                    mirror_present = true;
+                                }
+                            }
+                        }
+                        if (mirror_present) {
+                            auto source = metadata.GetReplicaByID(
+                                offload_it->second.source_id);
+                            if (source != nullptr) {
+                                source->dec_refcnt();
+                            }
+                            tenant_state.offloading_tasks.erase(offload_it);
+                        } else {
+                            LOG(INFO) << "key=" << key
+                                      << ", error=object_has_offloading_task";
+                            return tl::make_unexpected(
+                                ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                        }
+                    }
                 }
 
                 // Preempt an in-progress Put/Upsert on the same key.  The

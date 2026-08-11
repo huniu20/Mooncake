@@ -424,6 +424,130 @@ TEST_F(OffloadOnEvictTest, BatchRemoveDropsOffloadingObjectsMirror) {
            "offloading_objects.";
 }
 
+// =============================================================================
+// UpsertStart on a key with a QUEUED offload task must cancel the task in
+// place and allocate a fresh buffer, so the offload worker's read never
+// races with the client's RDMA write. If the task is IN-FLIGHT (mirror
+// already drained), the caller is rejected with OBJECT_HAS_REPLICATION_TASK
+// and must retry after NotifyOffloadSuccess clears the marker.
+// =============================================================================
+
+TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffload) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    const std::string key = "upsert_over_queued_offload";
+    constexpr size_t kSize = 1024;
+
+    // PutEnd populates offloading_tasks[key] and its LocalDisk mirror.
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto put_start =
+        service->PutStart(ctx.client_id, key, TenantId::Default(), kSize, cfg);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    ASSERT_TRUE(service
+                    ->PutEnd(ctx.client_id, key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    // UpsertStart without draining the heartbeat: mirror is still present
+    // so preempt takes the QUEUED branch and the caller can proceed.
+    auto upsert = service->UpsertStart(ctx.client_id, key, TenantId::Default(),
+                                       kSize, cfg);
+    ASSERT_TRUE(upsert.has_value())
+        << "expected UpsertStart to preempt a QUEUED offload, got error "
+        << static_cast<int>(upsert.error());
+    EXPECT_EQ(upsert->size(), 1u);
+    EXPECT_EQ(upsert->at(0).status, ReplicaStatus::PROCESSING);
+
+    // Preempt clears both the marker and the mirror; a follow-up heartbeat
+    // must not return a stale entry.
+    auto queued = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_TRUE(queued.empty()) << queued.size() << " stale entries";
+
+    ASSERT_TRUE(service
+                    ->PutEnd(ctx.client_id, key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+}
+
+TEST_F(OffloadOnEvictTest, BatchUpsertPreemptsQueuedOffload) {
+    // BatchUpsertStart delegates to UpsertStart per key; verify the batch
+    // path preempts every QUEUED offloading key.
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    const std::vector<std::string> keys = {"batch_k1", "batch_k2", "batch_k3"};
+    for (const auto& k : keys) {
+        PutObject(*service, ctx.client_id, k);
+    }
+
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    std::vector<uint64_t> sizes(keys.size(), 1024);
+    auto results = service->BatchUpsertStart(ctx.client_id, keys,
+                                             TenantId::Default(), sizes, cfg);
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_TRUE(results[i].has_value())
+            << "key '" << keys[i] << "' error "
+            << static_cast<int>(results[i].error());
+    }
+
+    auto queued = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_TRUE(queued.empty()) << queued.size() << " stale entries";
+}
+
+TEST_F(OffloadOnEvictTest, UpsertRejectedWhenOffloadInFlight) {
+    // OffloadObjectHeartbeat drains the mirror but leaves offloading_tasks
+    // in place until NotifyOffloadSuccess. UpsertStart in this window must
+    // reject with OBJECT_HAS_REPLICATION_TASK so the client retries after
+    // the worker's completion clears the marker.
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    const std::string key = "upsert_over_inflight_offload";
+    PutObject(*service, ctx.client_id, key);
+
+    // Drain the mirror; task marker survives.
+    auto hb = service->OffloadObjectHeartbeat(ctx.client_id, true);
+    ASSERT_TRUE(hb.has_value());
+    ASSERT_EQ(hb->size(), 1u);
+
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto upsert = service->UpsertStart(ctx.client_id, key, TenantId::Default(),
+                                       /*slice_length=*/1024, cfg);
+    ASSERT_FALSE(upsert.has_value())
+        << "UpsertStart must reject IN-FLIGHT offloads, not preempt them.";
+    EXPECT_EQ(upsert.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
